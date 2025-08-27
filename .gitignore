@@ -1,0 +1,14 @@
+# Diretórios de build e distribuição
+build/
+dist/
+__pycache__/
+
+# Ambientes virtuais
+venv/
+.env/
+
+# Arquivos do PyInstaller
+*.spec
+
+# Configurações do VSCode
+.vscode/
