@@ -1,2 +1,4 @@
-pytube>=15.0.0
+# Dependências do CapTube
+pytubefix>=11.2.1,<12
 PyQt5>=5.15.9
+imageio-ffmpeg>=0.5.1
