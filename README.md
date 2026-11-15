@@ -30,7 +30,7 @@ O layout foi desenvolvido em PyQt5, com foco em:
 
 ## 🛠️ Tecnologias Utilizadas
 
-- Python 3.11.9
+- Python 3.14.0
 - PyQt5 – Interface gráfica
 - pytube – Download de vídeos do YouTube
 - PyInstaller – Empacotamento do app em .exe
@@ -112,4 +112,4 @@ Projeto desenvolvido por Alex Menezes.
 ## 📃 Licença
 
 - Este projeto está licenciado sob os termos da [Licença MIT](LICENSE).
-- Copyright © 2025 CapTube - YouTube Downloader by Alex Menezes. Todos os direitos reservados.
+- Copyright © 2026 CapTube - YouTube Downloader by Alex Menezes. Todos os direitos reservados.
