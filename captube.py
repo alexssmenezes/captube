@@ -3,14 +3,26 @@ import os
 import re
 import time
 import threading
+import subprocess
+import tempfile
 from pathlib import Path
+
+import imageio_ffmpeg
 
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton,
-    QVBoxLayout, QHBoxLayout, QRadioButton, QMessageBox,
-    QProgressBar, QFileDialog
+    QApplication,
+    QWidget,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QHBoxLayout,
+    QRadioButton,
+    QMessageBox,
+    QProgressBar,
+    QFileDialog,
 )
 
 # Use pytubefix para maior resiliência a mudanças do YouTube
@@ -82,19 +94,19 @@ def unique_path(dest_dir: Path, base_name: str, ext: str) -> Path:
 # -------------------------
 class DownloadWorker(QThread):
     # Sinais para UI
-    progress = pyqtSignal(int)                 # progresso do item atual (0-100)
-    status = pyqtSignal(str)                   # mensagens de status
-    finished_ok = pyqtSignal()                 # finalizou tudo com sucesso
-    finished_with_cancel = pyqtSignal()        # cancelado
-    error = pyqtSignal(str)                    # erro fatal
-    item_done = pyqtSignal(str, str)           # (titulo, caminho) por item concluído
+    progress = pyqtSignal(int)  # progresso do item atual (0-100)
+    status = pyqtSignal(str)  # mensagens de status
+    finished_ok = pyqtSignal()  # finalizou tudo com sucesso
+    finished_with_cancel = pyqtSignal()  # cancelado
+    error = pyqtSignal(str)  # erro fatal
+    item_done = pyqtSignal(str, str)  # (titulo, caminho) por item concluído
 
     def __init__(self, url: str, dest_dir: Path, mode: str):
         super().__init__()
         self.url = url
         self.dest_dir = dest_dir
         self.mode = mode  # 'full' | 'audio' | 'video_only'
-        self.pause_event = threading.Event()   # quando set() -> PAUSADO
+        self.pause_event = threading.Event()  # quando set() -> PAUSADO
         self.cancel_event = threading.Event()
         self._current_total = None
 
@@ -119,7 +131,11 @@ class DownloadWorker(QThread):
         if self.cancel_event.is_set():
             raise Exception("Cancelado pelo usuário.")
 
-        total = self._current_total or getattr(stream, "filesize", None) or getattr(stream, "filesize_approx", None)
+        total = (
+            self._current_total
+            or getattr(stream, "filesize", None)
+            or getattr(stream, "filesize_approx", None)
+        )
         if not total:
             return
         done = total - bytes_remaining
@@ -127,82 +143,160 @@ class DownloadWorker(QThread):
         self.progress.emit(pct)
 
     def _select_stream(self, yt: YouTube):
+        """Seleciona os fluxos adequados ao modo escolhido.
+
+        Para 'full', retorna dois fluxos separados (vídeo + áudio), pois o
+        YouTube frequentemente disponibiliza apenas streams adaptativos.
         """
-        Seleciona o stream de acordo com o modo.
-        'full' => tenta progressivo MP4 (vídeo+áudio)
-        'audio' => apenas áudio (maior bitrate)
-        'video_only' => apenas vídeo (maior resolução)
-        """
-        try:
-            if self.mode == "full":
-                # Tenta o melhor progressivo MP4
-                stream = (
-                    yt.streams.filter(progressive=True, file_extension="mp4")
+        streams = yt.streams
+
+        if self.mode == "full":
+            video = (
+                streams.filter(only_video=True, file_extension="mp4")
+                .order_by("resolution")
+                .desc()
+                .first()
+            )
+            if video is None:
+                video = (
+                    streams.filter(only_video=True)
                     .order_by("resolution")
                     .desc()
                     .first()
                 )
-                if stream is None:
-                    # Último recurso: qualquer progressivo
-                    stream = (
-                        yt.streams.filter(progressive=True)
-                        .order_by("resolution")
-                        .desc()
-                        .first()
-                    )
-                return stream
 
-            if self.mode == "audio":
-                stream = (
-                    yt.streams.filter(only_audio=True)
-                    .order_by("abr")
-                    .desc()
-                    .first()
-                )
-                return stream
+            audio = (
+                streams.filter(only_audio=True, file_extension="mp4")
+                .order_by("abr")
+                .desc()
+                .first()
+            )
+            if audio is None:
+                audio = streams.filter(only_audio=True).order_by("abr").desc().first()
 
-            if self.mode == "video_only":
-                stream = (
-                    yt.streams.filter(only_video=True)
-                    .order_by("resolution")
-                    .desc()
-                    .first()
-                )
-                return stream
-        except Exception:
-            return None
+            if video is None or audio is None:
+                return None
+            return (video, audio)
+
+        if self.mode == "audio":
+            return streams.filter(only_audio=True).order_by("abr").desc().first()
+
+        if self.mode == "video_only":
+            return streams.filter(only_video=True).order_by("resolution").desc().first()
 
         return None
+
+    def _merge_video_audio(
+        self, video_stream, audio_stream, title: str, out_path: Path
+    ):
+        """Baixa vídeo e áudio separadamente e os une em MP4 sem recodificação."""
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.TemporaryDirectory(
+            prefix="captube_", dir=str(self.dest_dir)
+        ) as temp_name:
+            temp_dir = Path(temp_name)
+            video_ext = getattr(video_stream, "subtype", None) or "mp4"
+            audio_ext = getattr(audio_stream, "subtype", None) or "m4a"
+            video_path = temp_dir / f"video.{video_ext}"
+            audio_path = temp_dir / f"audio.{audio_ext}"
+
+            self.status.emit(f"Baixando vídeo: {title}")
+            self._current_total = getattr(video_stream, "filesize", None) or getattr(
+                video_stream, "filesize_approx", None
+            )
+            video_stream.download(output_path=str(temp_dir), filename=video_path.name)
+
+            if self.cancel_event.is_set():
+                raise Exception("Download cancelado pelo usuário.")
+
+            self.progress.emit(0)
+            self.status.emit(f"Baixando áudio: {title}")
+            self._current_total = getattr(audio_stream, "filesize", None) or getattr(
+                audio_stream, "filesize_approx", None
+            )
+            audio_stream.download(output_path=str(temp_dir), filename=audio_path.name)
+
+            if self.cancel_event.is_set():
+                raise Exception("Download cancelado pelo usuário.")
+
+            self.status.emit(f"Unindo áudio e vídeo: {title}")
+            command = [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(video_path),
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(out_path),
+            ]
+            result = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if (
+                result.returncode != 0
+                or not out_path.exists()
+                or out_path.stat().st_size == 0
+            ):
+                detail = (
+                    result.stderr or result.stdout or "Falha desconhecida no FFmpeg"
+                )[-2500:]
+                raise Exception(
+                    f"Não foi possível unir os fluxos de áudio e vídeo.\n{detail}"
+                )
 
     def _download_one(self, link: str):
         """
         Faz download de um único link, emitindo sinais conforme o progresso.
         """
         # Pode lançar exceção que será capturada no run()
+        # Deixe a biblioteca escolher seu cliente padrão compatível. Forçar WEB
+        # pode retornar manifests sem streams funcionais quando falta PO Token.
         yt = YouTube(link, on_progress_callback=self._on_progress)
         title = sanitize_filename(yt.title or "video")
-        stream = self._select_stream(yt)
+        selected = self._select_stream(yt)
 
-        if stream is None:
-            raise Exception("Não foi possível encontrar um stream compatível para esse modo.")
+        if selected is None:
+            try:
+                available = [str(item) for item in yt.streams]
+            except Exception as exc:
+                raise Exception(
+                    f"Não foi possível consultar os formatos do YouTube: {exc}"
+                ) from exc
+            details = (
+                "\n".join(available[:12])
+                if available
+                else "A biblioteca não recebeu nenhum formato de mídia."
+            )
+            raise Exception(
+                f"Não foram encontrados os fluxos necessários para o modo '{self.mode}'.\n\n"
+                f"Formatos identificados: {len(available)}\n{details}"
+            )
 
-        # Descobrir extensão correta
-        ext = getattr(stream, "subtype", None)
-        if not ext:
-            mime = getattr(stream, "mime_type", "")  # ex: "video/mp4"
-            ext = mime.split("/")[-1] if "/" in mime else "mp4"
+        if self.mode == "full":
+            # Fluxos adaptativos são baixados separadamente e unidos pelo FFmpeg.
+            out_path = unique_path(self.dest_dir, title, "mp4")
+            self._merge_video_audio(selected[0], selected[1], title, out_path)
+        else:
+            stream = selected
+            ext = getattr(stream, "subtype", None)
+            if not ext:
+                mime = getattr(stream, "mime_type", "")
+                ext = mime.split("/")[-1] if "/" in mime else "mp4"
+            self._current_total = getattr(stream, "filesize", None) or getattr(
+                stream, "filesize_approx", None
+            )
+            out_path = unique_path(self.dest_dir, title, ext)
+            self.status.emit(f"Iniciando: {yt.title}")
+            stream.download(output_path=str(self.dest_dir), filename=out_path.name)
 
-        # Tamanho total para cálculo do progresso
-        self._current_total = getattr(stream, "filesize", None) or getattr(stream, "filesize_approx", None)
-
-        # Caminho de saída único
-        out_path = unique_path(self.dest_dir, title, ext)
-
-        self.status.emit(f"Iniciando: {yt.title}")
-        # stream.download aceita output_path e filename (já garantimos unique_path)
-        stream.download(output_path=str(self.dest_dir), filename=out_path.name)
-
-        # Ao terminar o item
         self.progress.emit(100)
         self.item_done.emit(yt.title or title, str(out_path))
 
@@ -315,11 +409,15 @@ class YouTubeDownloader(QWidget):
         # Botões
         self.download_btn = QPushButton(" Baixar")
         self.download_btn.clicked.connect(self.download_content)
-        set_hover_icon(self.download_btn, "icons/download_black.png", "icons/download_black.png")
+        set_hover_icon(
+            self.download_btn, "icons/download_black.png", "icons/download_black.png"
+        )
 
         self.folder_btn = QPushButton(" Escolher Pasta")
         self.folder_btn.clicked.connect(self.choose_folder)
-        set_hover_icon(self.folder_btn, "icons/folder_black.png", "icons/folder_black.png")
+        set_hover_icon(
+            self.folder_btn, "icons/folder_black.png", "icons/folder_black.png"
+        )
 
         self.pause_btn = QPushButton(" Pause")
         self.pause_btn.clicked.connect(self.toggle_pause)
@@ -339,12 +437,28 @@ class YouTubeDownloader(QWidget):
                 padding: 8px 10px;
             }
         """
-        self.download_btn.setStyleSheet(common_btn_style + "QPushButton:hover { background-color: #80EF80; color: #000; }")
-        self.folder_btn.setStyleSheet(common_btn_style + "QPushButton:hover { background-color: #DFD880; color: #000; }")
-        self.pause_btn.setStyleSheet(common_btn_style + "QPushButton:hover { background-color: #ADD8E6; color: #000; }")
-        self.cancel_btn.setStyleSheet(common_btn_style + "QPushButton:hover { background-color: #FF746C; color: #FFF; }")
-        self.paste_btn.setStyleSheet("QPushButton:hover { background-color: #ADD8E6; border-radius: 6px; color: #000; }")
-        self.clear_btn.setStyleSheet("QPushButton:hover { background-color: #ADD8E6; border-radius: 6px; color: #000; }")
+        self.download_btn.setStyleSheet(
+            common_btn_style
+            + "QPushButton:hover { background-color: #80EF80; color: #000; }"
+        )
+        self.folder_btn.setStyleSheet(
+            common_btn_style
+            + "QPushButton:hover { background-color: #DFD880; color: #000; }"
+        )
+        self.pause_btn.setStyleSheet(
+            common_btn_style
+            + "QPushButton:hover { background-color: #ADD8E6; color: #000; }"
+        )
+        self.cancel_btn.setStyleSheet(
+            common_btn_style
+            + "QPushButton:hover { background-color: #FF746C; color: #FFF; }"
+        )
+        self.paste_btn.setStyleSheet(
+            "QPushButton:hover { background-color: #ADD8E6; border-radius: 6px; color: #000; }"
+        )
+        self.clear_btn.setStyleSheet(
+            "QPushButton:hover { background-color: #ADD8E6; border-radius: 6px; color: #000; }"
+        )
 
         # -------------------------
         # Layout principal (mantido)
@@ -367,7 +481,9 @@ class YouTubeDownloader(QWidget):
         vbox.addLayout(hbox)
 
         # Rodapé (igual ao original)
-        footer = QLabel("Copyright © 2025 CapTube Alex Menezes. Todos os direitos reservados.")
+        footer = QLabel(
+            "Copyright © 2026 CapTube Alex Menezes. Todos os direitos reservados."
+        )
         footer.setAlignment(Qt.AlignCenter)
         footer.setStyleSheet("color: gray; font-size: 10px; margin-top: 10px;")
         vbox.addWidget(footer)
@@ -469,7 +585,9 @@ class YouTubeDownloader(QWidget):
 
     def choose_folder(self):
         """Abre diálogo para escolher pasta de destino."""
-        folder = QFileDialog.getExistingDirectory(self, "Escolher pasta de destino", str(self.destino.resolve()))
+        folder = QFileDialog.getExistingDirectory(
+            self, "Escolher pasta de destino", str(self.destino.resolve())
+        )
         if folder:
             self.destino = Path(folder)
             self.status_label.setText(f"Pasta de destino: {self.destino}")
@@ -600,6 +718,7 @@ class YouTubeDownloader(QWidget):
         self.pause_btn.setText(" Pause")
         self.status_label.setText("Download cancelado.")
         QMessageBox.information(self, "Cancelado", "O download foi cancelado.")
+
 
 # -------------------------
 # Execução
